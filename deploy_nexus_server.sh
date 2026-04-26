@@ -989,6 +989,109 @@ start_services() {
   fi
 }
 
+wait_rpc_ready() {
+  local name="$1"
+  local port="$2"
+  local rpc="http://127.0.0.1:${port}"
+  local max_wait=180
+  local elapsed=0
+
+  echo "[信息] 等待 ${name} RPC 就绪：${rpc}"
+  while (( elapsed < max_wait )); do
+    local response
+    response="$(curl -s -H 'Content-Type: application/json' \
+      -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' \
+      "$rpc" 2>/dev/null || echo "")"
+    if [[ "$(echo "$response" | jq -r 'has("result")' 2>/dev/null || echo false)" == "true" ]]; then
+      echo "[信息] ${name} RPC 已就绪"
+      return 0
+    fi
+
+    sleep 5
+    elapsed=$((elapsed + 5))
+  done
+
+  echo "[错误] ${name} RPC 在 ${max_wait}s 内未就绪：${rpc}"
+  return 1
+}
+
+verify_deployment() {
+  echo "[信息] 开始验证部署结果..."
+  local failed=0
+
+  if deploys_validator; then
+    if systemctl is-active --quiet nexus-validator; then
+      echo "[成功] nexus-validator 服务正在运行"
+    else
+      echo "[错误] nexus-validator 服务未运行"
+      failed=1
+    fi
+
+    if wait_rpc_ready "验证者节点" "$VALIDATOR_RPC_PORT"; then
+      local rpc="http://127.0.0.1:${VALIDATOR_RPC_PORT}"
+      local health sync_state genesis_hash
+      health="$(curl -s -H 'Content-Type: application/json' \
+        -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' \
+        "$rpc" 2>/dev/null || echo "")"
+      sync_state="$(curl -s -H 'Content-Type: application/json' \
+        -d '{"id":1,"jsonrpc":"2.0","method":"system_syncState","params":[]}' \
+        "$rpc" 2>/dev/null || echo "")"
+      genesis_hash="$(curl -s -H 'Content-Type: application/json' \
+        -d '{"id":1,"jsonrpc":"2.0","method":"chain_getBlockHash","params":[0]}' \
+        "$rpc" 2>/dev/null | jq -r '.result // empty')"
+      echo "[信息] 验证者节点健康状态：$health"
+      echo "[信息] 验证者节点同步状态：$sync_state"
+      echo "[信息] 验证者节点 genesis hash：${genesis_hash:-unknown}"
+    else
+      failed=1
+    fi
+  fi
+
+  if deploys_rpc; then
+    if systemctl is-active --quiet nexus-rpc; then
+      echo "[成功] nexus-rpc 服务正在运行"
+    else
+      echo "[错误] nexus-rpc 服务未运行"
+      failed=1
+    fi
+
+    if wait_rpc_ready "RPC 节点" "$RPC_RPC_PORT"; then
+      local rpc="http://127.0.0.1:${RPC_RPC_PORT}"
+      local health sync_state genesis_hash
+      health="$(curl -s -H 'Content-Type: application/json' \
+        -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' \
+        "$rpc" 2>/dev/null || echo "")"
+      sync_state="$(curl -s -H 'Content-Type: application/json' \
+        -d '{"id":1,"jsonrpc":"2.0","method":"system_syncState","params":[]}' \
+        "$rpc" 2>/dev/null || echo "")"
+      genesis_hash="$(curl -s -H 'Content-Type: application/json' \
+        -d '{"id":1,"jsonrpc":"2.0","method":"chain_getBlockHash","params":[0]}' \
+        "$rpc" 2>/dev/null | jq -r '.result // empty')"
+      echo "[信息] RPC 节点健康状态：$health"
+      echo "[信息] RPC 节点同步状态：$sync_state"
+      echo "[信息] RPC 节点 genesis hash：${genesis_hash:-unknown}"
+    else
+      failed=1
+    fi
+  fi
+
+  if [[ "$INSTALL_IPFS" == "true" ]]; then
+    if systemctl is-active --quiet ipfs; then
+      echo "[成功] ipfs 服务正在运行"
+    else
+      echo "[错误] ipfs 服务未运行"
+      failed=1
+    fi
+  fi
+
+  if (( failed != 0 )); then
+    echo "[错误] 部署结果验证失败，请查看上方日志和 systemd 状态。"
+    return 1
+  fi
+
+  echo "[完成] 部署结果验证通过。"
+}
+
 # 等待验证者节点同步到最新区块
 wait_sync() {
   echo "[信息] 等待验证者节点同步..."
@@ -1414,6 +1517,7 @@ main() {
   configure_ufw
   start_services
   start_ipfs_service
+  verify_deployment
   if deploys_validator && [[ "$REGISTER_VALIDATOR" == "true" ]]; then
     wait_sync
     register_validator
