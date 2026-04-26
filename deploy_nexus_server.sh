@@ -25,6 +25,7 @@ _on_error() {
 trap '_on_error' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
 ENV_FILE="${ENV_FILE:-${SCRIPT_DIR}/deploy.env}"
 
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -36,15 +37,33 @@ fi
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
-# [修复] CHAIN 默认值：如果 deploy.env 设了相对路径或无效值，自动修正为脚本同目录下的绝对路径
-if [[ -n "${CHAIN:-}" && ! -f "$CHAIN" ]]; then
-  # 尝试在脚本目录下查找同名文件
-  if [[ -f "${SCRIPT_DIR}/${CHAIN}" ]]; then
-    CHAIN="${SCRIPT_DIR}/${CHAIN}"
-  elif [[ -f "${SCRIPT_DIR}/${CHAIN}-raw.json" ]]; then
-    CHAIN="${SCRIPT_DIR}/${CHAIN}-raw.json"
+# 自动解析 Chain spec 路径：
+# - 未配置 CHAIN 时，默认使用脚本同目录下的 mainnet-raw.json
+# - 配置为相对路径时，按脚本同目录解析
+# - 配置为旧的绝对路径但文件不存在时，按脚本同目录查找同名文件
+resolve_chain_path() {
+  local chain_value="${CHAIN:-mainnet-raw.json}"
+  local chain_name
+
+  if [[ -f "$chain_value" ]]; then
+    CHAIN="$chain_value"
+    return
   fi
-fi
+
+  if [[ "$chain_value" = /* ]]; then
+    chain_name="$(basename "$chain_value")"
+  else
+    chain_name="$chain_value"
+  fi
+
+  if [[ -f "${SCRIPT_DIR}/${chain_name}" ]]; then
+    CHAIN="${SCRIPT_DIR}/${chain_name}"
+  elif [[ -f "${SCRIPT_DIR}/${chain_name}-raw.json" ]]; then
+    CHAIN="${SCRIPT_DIR}/${chain_name}-raw.json"
+  else
+    CHAIN="$chain_value"
+  fi
+}
 
 require_var() {
   local name="$1"
@@ -253,13 +272,17 @@ validate_config() {
   fi
 }
 
-: "${DEPLOY_MODE:=both}"
-: "${CHAIN:=${SCRIPT_DIR}/mainnet-raw.json}"
-: "${INSTALL_DIR:=/opt/nexus}"
+: "${DEPLOY_MODE:=validator}"
+: "${CHAIN:=mainnet-raw.json}"
+resolve_chain_path
+: "${AUTO_STORAGE:=true}"
+: "${STORAGE_MIN_FREE_GB:=20}"
+: "${STORAGE_ROOT:=}"
+: "${INSTALL_DIR:=}"
 : "${BIN_INSTALL_PATH:=/usr/local/bin/nexus-node}"
-: "${DATA_ROOT:=/data/nexus}"
-: "${LOG_ROOT:=/var/log/nexus}"
-: "${DEPLOY_LOG_DIR:=${LOG_ROOT}/deploy}"
+: "${DATA_ROOT:=}"
+: "${LOG_ROOT:=}"
+: "${DEPLOY_LOG_DIR:=}"
 : "${DEPLOY_LOG_FILE:=}"
 : "${VALIDATOR_NAME:=Validator-1}"
 : "${RPC_NAME:=RPC-Public}"
@@ -289,10 +312,79 @@ validate_config() {
 : "${IPFS_VERSION:=0.40.1}"
 : "${IPFS_DIST_BASE:=https://dist.ipfs.tech/kubo}"
 : "${IPFS_INSTALL_ROOT:=/opt}"
-: "${IPFS_PATH:=/data/ipfs}"
+: "${IPFS_PATH:=}"
 : "${IPFS_USER:=root}"
 
+: "${TMUX_SESSION:=nexus}"
+: "${DEPLOY_LOCK_FILE:=/tmp/nexus-deploy.lock}"
+
 : "${GITHUB_REPO_URL:=https://github.com/nexus-blockchain/nexus.git}"
+
+choose_storage_root() {
+  if [[ -n "${STORAGE_ROOT:-}" ]]; then
+    return
+  fi
+
+  if [[ "${AUTO_STORAGE}" != "true" ]]; then
+    STORAGE_ROOT="/opt/nexus-runtime"
+    return
+  fi
+
+  local best_mount=""
+  local best_avail=0
+  local mount avail
+  while read -r mount avail; do
+    [[ -z "$mount" || -z "$avail" ]] && continue
+    case "$mount" in
+      /boot|/run|/dev|/dev/shm|/run/lock|/run/user/*|/snap/*) continue ;;
+    esac
+    if [[ -w "$mount" && "$avail" =~ ^[0-9]+$ && "$avail" -gt "$best_avail" ]]; then
+      best_mount="$mount"
+      best_avail="$avail"
+    fi
+  done < <(df -B1 --output=target,avail 2>/dev/null | tail -n +2)
+
+  if [[ -z "$best_mount" ]]; then
+    while read -r _ _ _ avail _ mount; do
+      [[ -z "$mount" || -z "$avail" ]] && continue
+      case "$mount" in
+        /boot|/run|/dev|/dev/shm|/run/lock|/run/user/*|/snap/*) continue ;;
+      esac
+      avail="${avail%B}"
+      if [[ -w "$mount" && "$avail" =~ ^[0-9]+$ && "$avail" -gt "$best_avail" ]]; then
+        best_mount="$mount"
+        best_avail="$avail"
+      fi
+    done < <(df -PB1 2>/dev/null | tail -n +2)
+  fi
+
+  if [[ -z "$best_mount" ]]; then
+    STORAGE_ROOT="/opt/nexus-runtime"
+    return
+  fi
+
+  STORAGE_ROOT="${best_mount%/}/nexus"
+
+  local min_bytes=$((STORAGE_MIN_FREE_GB * 1024 * 1024 * 1024))
+  if (( best_avail < min_bytes )); then
+    echo "[警告] 最大可用磁盘挂载点 ${best_mount} 仅剩 $((best_avail / 1024 / 1024 / 1024))GB，低于建议值 ${STORAGE_MIN_FREE_GB}GB。"
+  fi
+}
+
+apply_storage_layout() {
+  choose_storage_root
+  INSTALL_DIR="${INSTALL_DIR:-${STORAGE_ROOT}/source}"
+  DATA_ROOT="${DATA_ROOT:-${STORAGE_ROOT}/data}"
+  LOG_ROOT="${LOG_ROOT:-${STORAGE_ROOT}/logs}"
+  DEPLOY_LOG_DIR="${DEPLOY_LOG_DIR:-${LOG_ROOT}/deploy}"
+  IPFS_PATH="${IPFS_PATH:-${STORAGE_ROOT}/ipfs}"
+  VALIDATOR_BASE_PATH="${VALIDATOR_BASE_PATH:-${DATA_ROOT}/validator}"
+  RPC_BASE_PATH="${RPC_BASE_PATH:-${DATA_ROOT}/rpc}"
+
+  export STORAGE_ROOT INSTALL_DIR DATA_ROOT LOG_ROOT DEPLOY_LOG_DIR IPFS_PATH VALIDATOR_BASE_PATH RPC_BASE_PATH
+}
+
+apply_storage_layout
 
 # [修复3] 移除无条件 require_var RPC_DOMAIN / ADMIN_IP，已在 validate_config 中按条件校验
 
@@ -300,7 +392,7 @@ validate_config() {
 apt_install() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y curl wget jq git build-essential pkg-config libssl-dev \
+  apt-get install -y curl wget jq git tmux build-essential pkg-config libssl-dev \
     clang libclang-dev cmake llvm-dev libudev-dev protobuf-compiler
 
   # 安装 Node.js 18+（@polkadot/api 需要 node:* 前缀，最低 Node.js 16；推荐 18 LTS）
@@ -338,6 +430,16 @@ install_ipfs() {
   fi
 
   local version="$IPFS_VERSION"
+  if command -v ipfs >/dev/null 2>&1; then
+    local installed_version
+    installed_version="$(ipfs --version 2>/dev/null | awk '{print $3}')"
+    if [[ "$installed_version" == "$version" ]]; then
+      echo "[信息] 已安装 IPFS Kubo v${version}，跳过下载安装"
+      return
+    fi
+    echo "[信息] 当前 IPFS 版本为 ${installed_version:-未知}，将安装 v${version}"
+  fi
+
   local archive_name="kubo_v${version}_linux-amd64.tar.gz"
   local download_url="${IPFS_DIST_BASE}/v${version}/${archive_name}"
   local workdir="${IPFS_INSTALL_ROOT%/}/kubo-v${version}"
@@ -402,6 +504,9 @@ prepare_dirs() {
   mkdir -p "$DATA_ROOT" "$LOG_ROOT" "$DEPLOY_LOG_DIR"
   if deploys_validator; then
     mkdir -p "$VALIDATOR_BASE_PATH" "$VALIDATOR_BASE_PATH/chains/${chain_id}/network"
+  fi
+  if deploys_rpc; then
+    mkdir -p "$RPC_BASE_PATH" "$RPC_BASE_PATH/chains/${chain_id}/network"
   fi
   if [[ "$INSTALL_IPFS" == "true" ]]; then
     mkdir -p "$IPFS_PATH"
@@ -543,6 +648,8 @@ generate_network_keys() {
 
   if deploys_validator; then
     local val_key_file="$VALIDATOR_BASE_PATH/chains/${chain_id}/network/secret_ed25519"
+    mkdir -p "$(dirname "$val_key_file")"
+    chmod 700 "$(dirname "$val_key_file")"
     if ! VALIDATOR_PEER_ID="$($BIN_INSTALL_PATH key generate-node-key --file "$val_key_file" 2>&1)"; then
       echo "[错误] 生成 Validator 网络密钥失败"
       echo "  输出：$VALIDATOR_PEER_ID"
@@ -555,6 +662,8 @@ generate_network_keys() {
 
   if deploys_rpc; then
     local rpc_key_file="$RPC_BASE_PATH/chains/${chain_id}/network/secret_ed25519"
+    mkdir -p "$(dirname "$rpc_key_file")"
+    chmod 700 "$(dirname "$rpc_key_file")"
     if ! RPC_PEER_ID="$($BIN_INSTALL_PATH key generate-node-key --file "$rpc_key_file" 2>&1)"; then
       echo "[错误] 生成 RPC 网络密钥失败"
       echo "  输出：$RPC_PEER_ID"
@@ -884,10 +993,9 @@ start_services() {
 wait_sync() {
   echo "[信息] 等待验证者节点同步..."
   local rpc="http://127.0.0.1:${VALIDATOR_RPC_PORT}"
-  local max_wait=1800  # 最长等待 30 分钟
   local elapsed=0
 
-  while (( elapsed < max_wait )); do
+  while true; do
     local health
     health="$(curl -s -H 'Content-Type: application/json' \
       -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' \
@@ -895,7 +1003,7 @@ wait_sync() {
 
     if [[ -n "$health" ]]; then
       local is_syncing
-      is_syncing="$(echo "$health" | jq -r '.result.isSyncing // true')"
+      is_syncing="$(echo "$health" | jq -r 'if .result.isSyncing == false then "false" else "true" end')"
       if [[ "$is_syncing" == "false" ]]; then
         echo "[信息] 节点已同步到最新区块"
         return 0
@@ -905,29 +1013,15 @@ wait_sync() {
     sleep 10
     elapsed=$((elapsed + 10))
     if (( elapsed % 60 == 0 )); then
+      local sync_state
+      sync_state="$(curl -s -H 'Content-Type: application/json' \
+        -d '{"id":1,"jsonrpc":"2.0","method":"system_syncState","params":[]}' \
+        "$rpc" 2>/dev/null || echo "(无法获取同步状态)")"
       echo "[信息] 仍在同步，已等待 ${elapsed}s..."
+      echo "  节点健康状态：$health"
+      echo "  同步进度：$sync_state"
     fi
   done
-
-  echo "[警告] 等待同步超时（${max_wait}s），继续尝试注册..."
-  echo
-  # 输出诊断信息帮助运维排查
-  local diag_health diag_peers diag_sync
-  diag_health="$(curl -s -H 'Content-Type: application/json' \
-    -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' \
-    "$rpc" 2>/dev/null || echo "(无法连接 RPC)")"
-  diag_sync="$(curl -s -H 'Content-Type: application/json' \
-    -d '{"id":1,"jsonrpc":"2.0","method":"system_syncState","params":[]}' \
-    "$rpc" 2>/dev/null || echo "(无法获取同步状态)")"
-  echo "  节点健康状态：$diag_health"
-  echo "  同步进度：$diag_sync"
-  echo
-  echo "  排查建议："
-  echo "  1. 检查节点日志：tail -100 ${LOG_ROOT}/validator.log"
-  echo "  2. 确认 bootnodes 可达：curl -s telnet://<bootnode_ip>:30333 或 nc -zv <bootnode_ip> 30333"
-  echo "  3. 检查防火墙是否放行 P2P 端口 ${VALIDATOR_P2P_PORT}"
-  echo "  4. 如果 peers=0，可能是 chain spec 不匹配或 bootnodes 已下线。"
-  echo "  5. 同步可能需要更长时间。节点会在后台继续同步，可稍后手动注册。"
 }
 
 # 链上注册验证者：bond + setKeys + validate
@@ -1194,6 +1288,93 @@ EOF
   fi
 }
 
+print_runtime_status() {
+  echo "[信息] tmux 会话："
+  if command -v tmux >/dev/null 2>&1; then
+    tmux ls 2>/dev/null || echo "未发现 tmux 会话"
+  else
+    echo "tmux 未安装"
+  fi
+
+  echo
+  echo "[信息] 相关进程："
+  pgrep -af 'cargo|rustc|nexus-node|wasm-opt|rocksdb' || echo "未发现相关进程"
+
+  echo
+  echo "[信息] 监听端口："
+  ss -lntp 2>/dev/null | grep -E '9944|9947|9933|30333|30334|nexus' || echo "未发现常见节点端口"
+
+  echo
+  echo "[信息] systemd 服务："
+  systemctl --no-pager --full status nexus-validator nexus-rpc ipfs 2>/dev/null || true
+}
+
+print_recent_logs() {
+  local log_file="${DEPLOY_LOG_FILE:-}"
+  if [[ -z "$log_file" && -d "$DEPLOY_LOG_DIR" ]]; then
+    log_file="$(ls -t "$DEPLOY_LOG_DIR"/deploy-*.log 2>/dev/null | head -1 || true)"
+  fi
+
+  if [[ -n "$log_file" && -f "$log_file" ]]; then
+    echo "[信息] 最新部署日志：$log_file"
+    tail -f "$log_file"
+  else
+    echo "[错误] 未找到部署日志。"
+    echo "  默认目录：$DEPLOY_LOG_DIR"
+    exit 1
+  fi
+}
+
+start_in_tmux() {
+  require_root
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "[信息] 正在安装 tmux..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y tmux
+  fi
+
+  mkdir -p "$DEPLOY_LOG_DIR"
+  if [[ -z "$DEPLOY_LOG_FILE" ]]; then
+    DEPLOY_LOG_FILE="${DEPLOY_LOG_DIR}/deploy-$(date +%Y%m%d-%H%M%S).log"
+  fi
+
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    echo "[信息] 部署 tmux 会话已存在：$TMUX_SESSION"
+    echo "[提示] 说明后台可能仍在编译或部署，请勿重复启动。"
+    echo "[提示] 查看状态：bash $SCRIPT_PATH status"
+    echo "[提示] 查看日志：bash $SCRIPT_PATH logs"
+    echo "[提示] 进入会话：bash $SCRIPT_PATH attach"
+    exit 0
+  fi
+
+  if pgrep -af 'cargo|rustc|wasm-opt|rocksdb' >/dev/null 2>&1; then
+    echo "[警告] 检测到编译相关进程正在运行，可能已有部署任务："
+    pgrep -af 'cargo|rustc|wasm-opt|rocksdb' || true
+    echo
+    echo "[提示] 如确认不是本次部署，可手动处理后再运行。"
+    echo "[提示] 查看状态：bash $SCRIPT_PATH status"
+    exit 1
+  fi
+
+  echo "[信息] 启动后台部署 tmux 会话：$TMUX_SESSION"
+  echo "[信息] 部署日志文件：$DEPLOY_LOG_FILE"
+  tmux new-session -d -s "$TMUX_SESSION" "cd '$SCRIPT_DIR' && DEPLOY_LOG_FILE='$DEPLOY_LOG_FILE' flock -n '$DEPLOY_LOCK_FILE' bash '$SCRIPT_PATH' run"
+  echo "[完成] 部署已在后台运行。SSH 断开不会中断部署。"
+  echo "[提示] 查看日志：bash $SCRIPT_PATH logs"
+  echo "[提示] 查看状态：bash $SCRIPT_PATH status"
+  echo "[提示] 进入会话：bash $SCRIPT_PATH attach"
+}
+
+attach_tmux() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "[错误] tmux 未安装。"
+    exit 1
+  fi
+  tmux attach -t "$TMUX_SESSION"
+}
+
 main() {
   # [修复] 先安装基础依赖，再检查
   if ! command -v jq >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
@@ -1205,6 +1386,13 @@ main() {
   require_cmd jq
   require_cmd curl
   require_cmd git
+
+  echo "[信息] 存储规划："
+  echo "  STORAGE_ROOT=$STORAGE_ROOT"
+  echo "  INSTALL_DIR=$INSTALL_DIR"
+  echo "  DATA_ROOT=$DATA_ROOT"
+  echo "  LOG_ROOT=$LOG_ROOT"
+  echo "  IPFS_PATH=$IPFS_PATH"
 
   validate_config
   prepare_dirs
@@ -1234,18 +1422,39 @@ main() {
 }
 
 # 支持单独调用函数：
-#   bash deploy_nexus_server.sh                  — 完整部署
+#   bash deploy_nexus_server.sh                  — 在 tmux 后台启动完整部署
+#   bash deploy_nexus_server.sh start            — 在 tmux 后台启动完整部署
+#   bash deploy_nexus_server.sh run              — 前台执行完整部署（通常由 tmux 调用）
+#   bash deploy_nexus_server.sh status           — 查看 tmux、编译进程、端口和 systemd 服务
+#   bash deploy_nexus_server.sh logs             — 跟踪最新部署日志
+#   bash deploy_nexus_server.sh attach           — 进入部署 tmux 会话
 #   bash deploy_nexus_server.sh register         — 仅注册验证者
 #   source deploy_nexus_server.sh noop           — 仅加载函数，不执行
-case "${1:-}" in
+case "${1:-start}" in
+  start|"")
+    start_in_tmux
+    ;;
+  run)
+    main "${@:2}"
+    ;;
+  status)
+    print_runtime_status
+    ;;
+  logs)
+    print_recent_logs
+    ;;
+  attach)
+    attach_tmux
+    ;;
   register)
-    source "$(dirname "$0")/deploy.env" 2>/dev/null || true
+    setup_logging
     REGISTER_VALIDATOR=true register_validator
     ;;
   noop)
     : # 仅加载函数
     ;;
   *)
-    main "$@"
+    echo "用法：$0 {start|run|status|logs|attach|register|noop}"
+    exit 1
     ;;
 esac

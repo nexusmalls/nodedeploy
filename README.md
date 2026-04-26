@@ -59,7 +59,7 @@ nano deploy.env
 
 ```bash
 DEPLOY_REF="main"
-DEPLOY_MODE="both"   # 可选：validator / rpc / both
+DEPLOY_MODE="validator"   # 默认：只部署验证者；可选：validator / rpc / both
 BOOTNODES="/ip4/<bootnode-ip>/tcp/30333/p2p/12D3KooW..."
 
 # DEPLOY_MODE=validator 或 both 时需要
@@ -81,7 +81,7 @@ ENABLE_UFW="false"
 
 - `DEPLOY_MODE="validator"`：仅部署验证者节点
 - `DEPLOY_MODE="rpc"`：仅部署 RPC 节点
-- `DEPLOY_MODE="both"`：同时部署验证者 + RPC 节点（默认）
+- `DEPLOY_MODE="both"`：同时部署验证者 + RPC 节点
 
 如果暂时不想自动注册验证者，改为：
 
@@ -169,7 +169,7 @@ bash deploy_nexus_server.sh register
 
 - `DEPLOY_MODE=validator`：仅部署 `nexus-validator`
 - `DEPLOY_MODE=rpc`：仅部署 `nexus-rpc`
-- `DEPLOY_MODE=both`：同时部署两者（默认）
+- `DEPLOY_MODE=both`：同时部署两者
 
 服务说明：
 
