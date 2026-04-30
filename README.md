@@ -123,20 +123,20 @@ systemctl status nexus-rpc --no-pager
 
 ```bash
 # DEPLOY_MODE=both
-tail -f /var/log/nexus/validator.log
-tail -f /var/log/nexus/rpc.log
+tail -f "${LOG_ROOT}/validator.log"
+tail -f "${LOG_ROOT}/rpc.log"
 
 # 任意模式，如启用了 INSTALL_IPFS=true
 journalctl -u ipfs -f
 
 # DEPLOY_MODE=validator
-tail -f /var/log/nexus/validator.log
+tail -f "${LOG_ROOT}/validator.log"
 
 # DEPLOY_MODE=rpc
-tail -f /var/log/nexus/rpc.log
+tail -f "${LOG_ROOT}/rpc.log"
 ```
 
-检查 RPC：
+检查 RPC（以下 localhost 检查只能证明本机服务可用，不能代表公网交付已完成）：
 
 ```bash
 curl -s -H 'Content-Type: application/json' \
@@ -144,11 +144,21 @@ curl -s -H 'Content-Type: application/json' \
   http://127.0.0.1:9947 | jq
 ```
 
+如果启用了 Nginx，请继续检查公网入口（HTTP 或 HTTPS 取决于证书状态）：
+
+```bash
+curl -s -H 'Content-Type: application/json' \
+  -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' \
+  https://rpc.example.com | jq
+```
+
 如果前面设置了 `DEPLOY_MODE="validator"` 或 `DEPLOY_MODE="both"`，且 `REGISTER_VALIDATOR="false"`，节点同步且账户充值后执行：
 
 ```bash
 bash deploy_nexus_server.sh register
 ```
+
+该命令会先检查 validator 服务、等待本机 RPC 就绪并等待节点同步完成，再提交注册交易。
 
 ### 快速部署检查清单
 
@@ -174,7 +184,7 @@ bash deploy_nexus_server.sh register
 服务说明：
 
 - `nexus-validator`：验证者节点，使用 `--validator` 启动。
-- `nexus-rpc`：公网 RPC 节点，使用 `--rpc-external --rpc-cors all --rpc-methods Safe` 启动。
+- `nexus-rpc`：公网 RPC 节点，使用受限 CORS 来源和 `--rpc-methods Safe` 启动；推荐始终放在 Nginx / HTTPS 后面。
 
 脚本不会创建新的创世链，也不会修改现网创世配置。它默认通过 `BOOTNODES` 加入已有网络。
 
@@ -195,7 +205,7 @@ docs/scripts/
 建议环境：
 
 - Ubuntu 22.04 或兼容版本
-- root 用户执行
+- root 用户执行部署脚本（安装依赖、写 systemd、配置 Nginx/Certbot/UFW 仍需要 root）
 - 至少 4GB 内存，推荐 8GB+
 - 至少 20GB 可用磁盘空间
 - 能访问 GitHub、Rustup、NodeSource、npm registry
@@ -420,28 +430,28 @@ systemctl status nexus-validator --no-pager
 systemctl status nexus-rpc --no-pager
 ```
 
-查看日志（按 `DEPLOY_MODE` 选择对应命令）：
+查看日志（按 `DEPLOY_MODE` 选择对应命令，实际目录以部署时输出的 `LOG_ROOT` 为准）：
 
 ```bash
 # DEPLOY_MODE=both
-tail -f /var/log/nexus/validator.log
-tail -f /var/log/nexus/rpc.log
+tail -f "${LOG_ROOT}/validator.log"
+tail -f "${LOG_ROOT}/rpc.log"
 
 # 任意模式，如启用了 INSTALL_IPFS=true
 journalctl -u ipfs -f
 
 # DEPLOY_MODE=validator
-tail -f /var/log/nexus/validator.log
+tail -f "${LOG_ROOT}/validator.log"
 
 # DEPLOY_MODE=rpc
-tail -f /var/log/nexus/rpc.log
+tail -f "${LOG_ROOT}/rpc.log"
 ```
 
 查看部署日志：
 
 ```bash
-ls -lh /var/log/nexus/deploy/
-tail -100 /var/log/nexus/deploy/deploy-*.log
+ls -lh "${DEPLOY_LOG_DIR}"
+tail -100 "${DEPLOY_LOG_DIR}"/deploy-*.log
 ```
 
 检查本机 RPC：
@@ -482,7 +492,21 @@ REGISTER_VALIDATOR="false"
 bash deploy_nexus_server.sh register
 ```
 
-该模式只执行验证者注册逻辑，提交：
+如果只想先看当前还缺哪些步骤，不想旋转 keys 或提交交易，可以执行：
+
+```bash
+bash deploy_nexus_server.sh register --dry-run
+```
+
+该命令会先检查 validator 服务、等待本机 RPC 就绪并等待同步完成，再按链上当前状态补齐缺失的 `staking.bond` / `session.setKeys` / `staking.validate`。
+
+如果之前某一步已经成功，再次执行会自动跳过已完成步骤；当注册已经完整完成时，再执行会直接返回成功，不会重复提交无意义交易。
+
+每次执行 `register` 后，脚本还会把本次检查/提交摘要写入 `${DEPLOY_LOG_DIR}/register-status.json`（可通过 `REGISTER_STATUS_FILE` 覆盖路径），方便排查上次做到哪一步。
+
+`register --dry-run` 也会写摘要文件，但不会调用 `author_rotateKeys`，也不会提交任何交易。
+
+该模式只执行验证者注册逻辑，可能提交：
 
 - `staking.bond`
 - `session.setKeys`
@@ -598,7 +622,7 @@ bash deploy_nexus_server.sh register
 
 ### 7. Certbot 证书申请失败
 
-脚本会继续完成节点部署。常见原因：
+脚本会继续把本机 RPC 和 Nginx 配好，但这**不代表公网 HTTPS 已交付完成**。常见原因：
 
 - DNS 尚未解析到本机 IP。
 - 80 / 443 端口未放行。
@@ -608,9 +632,30 @@ DNS 就绪后执行：
 
 ```bash
 certbot --nginx --non-interactive --agree-tos -m <email> -d <domain>
+systemctl status nexus-rpc nginx --no-pager
+curl -s -H 'Content-Type: application/json' \
+  -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' \
+  https://<domain> | jq
 ```
 
-### 8. 节点 peers 为 0
+### 8. RPC 恢复检查
+
+如果 localhost 可用，但公网域名不可用，按顺序检查：
+
+```bash
+systemctl status nexus-rpc nginx --no-pager
+nginx -t
+curl -s -H 'Content-Type: application/json' \
+  -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' \
+  http://127.0.0.1:9947 | jq
+curl -s -H 'Content-Type: application/json' \
+  -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' \
+  https://<domain> | jq
+journalctl -u nginx -n 100 --no-pager
+journalctl -u nexus-rpc -n 100 --no-pager
+```
+
+### 9. 节点 peers 为 0
 
 重点检查：
 

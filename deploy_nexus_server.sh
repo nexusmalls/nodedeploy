@@ -6,6 +6,28 @@ set -euo pipefail
 # 服务器密码、GitHub Token、验证者助记词等高敏感信息严禁提交到仓库。
 
 # 全局 trap：捕获未处理的错误，打印失败位置和日志路径
+LOG_TS_FORMAT="+%Y-%m-%d %H:%M:%S"
+
+log_info() {
+  printf '[%s] [信息] %s\n' "$(date "$LOG_TS_FORMAT")" "$*"
+}
+
+log_warn() {
+  printf '[%s] [警告] %s\n' "$(date "$LOG_TS_FORMAT")" "$*"
+}
+
+log_success() {
+  printf '[%s] [成功] %s\n' "$(date "$LOG_TS_FORMAT")" "$*"
+}
+
+log_todo() {
+  printf '[%s] [待办] %s\n' "$(date "$LOG_TS_FORMAT")" "$*"
+}
+
+log_sensitive() {
+  printf '[%s] [敏感信息] %s\n' "$(date "$LOG_TS_FORMAT")" "$*"
+}
+
 _on_error() {
   local exit_code=$?
   local line_no="${BASH_LINENO[0]}"
@@ -188,8 +210,8 @@ validate_config() {
   validate_bool INSTALL_IPFS
   validate_port SSH_PORT
 
-  if [[ "$NODE_USER" != "root" ]]; then
-    echo "[错误] 当前脚本仅稳定支持 NODE_USER=root，请先使用 root。"
+  if [[ "$NODE_USER" != "root" && deploys_validator ]]; then
+    echo "[错误] 当前脚本仅稳定支持 validator 使用 NODE_USER=root；RPC 服务会单独降权运行。"
     exit 1
   fi
 
@@ -283,7 +305,7 @@ resolve_chain_path
 : "${DATA_ROOT:=}"
 : "${LOG_ROOT:=}"
 : "${DEPLOY_LOG_DIR:=}"
-: "${DEPLOY_LOG_FILE:=}"
+: "${REGISTER_STATUS_FILE:=}"
 : "${VALIDATOR_NAME:=Validator-1}"
 : "${RPC_NAME:=RPC-Public}"
 : "${VALIDATOR_BASE_PATH:=${DATA_ROOT}/validator}"
@@ -296,6 +318,7 @@ resolve_chain_path
 : "${RPC_PROM_PORT:=9616}"
 : "${SSH_PORT:=22}"
 : "${NODE_USER:=root}"
+: "${RPC_SERVICE_USER:=nexusrpc}"
 : "${ENABLE_UFW:=true}"
 : "${OPEN_RPC_P2P:=true}"
 : "${INSTALL_NGINX:=true}"
@@ -377,11 +400,12 @@ apply_storage_layout() {
   DATA_ROOT="${DATA_ROOT:-${STORAGE_ROOT}/data}"
   LOG_ROOT="${LOG_ROOT:-${STORAGE_ROOT}/logs}"
   DEPLOY_LOG_DIR="${DEPLOY_LOG_DIR:-${LOG_ROOT}/deploy}"
+  REGISTER_STATUS_FILE="${REGISTER_STATUS_FILE:-${DEPLOY_LOG_DIR}/register-status.json}"
   IPFS_PATH="${IPFS_PATH:-${STORAGE_ROOT}/ipfs}"
   VALIDATOR_BASE_PATH="${VALIDATOR_BASE_PATH:-${DATA_ROOT}/validator}"
   RPC_BASE_PATH="${RPC_BASE_PATH:-${DATA_ROOT}/rpc}"
 
-  export STORAGE_ROOT INSTALL_DIR DATA_ROOT LOG_ROOT DEPLOY_LOG_DIR IPFS_PATH VALIDATOR_BASE_PATH RPC_BASE_PATH
+  export STORAGE_ROOT INSTALL_DIR DATA_ROOT LOG_ROOT DEPLOY_LOG_DIR REGISTER_STATUS_FILE IPFS_PATH VALIDATOR_BASE_PATH RPC_BASE_PATH
 }
 
 apply_storage_layout
@@ -401,15 +425,15 @@ apt_install() {
     node_major="$(node --version | sed 's/^v//' | cut -d. -f1)"
   fi
   if [[ -z "$node_major" || "$node_major" -lt 18 ]]; then
-    echo "[信息] 当前 Node.js 版本不满足要求（需要 ≥18），正在安装 Node.js 18 LTS..."
+    log_info "当前 Node.js 版本不满足要求（需要 ≥18），正在安装 Node.js 18 LTS..."
     if [[ -n "$node_major" ]]; then
       echo "  当前版本：$(node --version)"
     fi
     curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
     apt-get install -y nodejs
-    echo "[信息] Node.js 已升级至 $(node --version)"
+    log_info "Node.js 已升级至 $(node --version)"
   else
-    echo "[信息] Node.js $(node --version) 满足要求"
+    log_info "Node.js $(node --version) 满足要求"
   fi
 
   if [[ "$ENABLE_UFW" == "true" ]]; then
@@ -425,7 +449,7 @@ apt_install() {
 
 install_ipfs() {
   if [[ "$INSTALL_IPFS" != "true" ]]; then
-    echo "[信息] 已跳过 IPFS 安装（INSTALL_IPFS=false）"
+    log_info "已跳过 IPFS 安装（INSTALL_IPFS=false）"
     return
   fi
 
@@ -434,10 +458,10 @@ install_ipfs() {
     local installed_version
     installed_version="$(ipfs --version 2>/dev/null | awk '{print $3}')"
     if [[ "$installed_version" == "$version" ]]; then
-      echo "[信息] 已安装 IPFS Kubo v${version}，跳过下载安装"
+      log_info "已安装 IPFS Kubo v${version}，跳过下载安装"
       return
     fi
-    echo "[信息] 当前 IPFS 版本为 ${installed_version:-未知}，将安装 v${version}"
+    log_info "当前 IPFS 版本为 ${installed_version:-未知}，将安装 v${version}"
   fi
 
   local archive_name="kubo_v${version}_linux-amd64.tar.gz"
@@ -445,7 +469,7 @@ install_ipfs() {
   local workdir="${IPFS_INSTALL_ROOT%/}/kubo-v${version}"
   local extract_dir="${workdir}/kubo"
 
-  echo "[信息] 开始安装 IPFS Kubo v${version}"
+  log_info "开始安装 IPFS Kubo v${version}"
   rm -rf "$workdir"
   mkdir -p "$workdir"
   wget -O "${workdir}/${archive_name}" "$download_url"
@@ -474,10 +498,10 @@ ensure_ipfs_repo() {
   mkdir -p "$IPFS_PATH"
 
   if [[ ! -f "$IPFS_PATH/config" ]]; then
-    echo "[信息] 初始化 IPFS 仓库：$IPFS_PATH"
+    log_info "初始化 IPFS 仓库：$IPFS_PATH"
     IPFS_PATH="$IPFS_PATH" ipfs init
   else
-    echo "[信息] 复用现有 IPFS 仓库：$IPFS_PATH"
+    log_info "复用现有 IPFS 仓库：$IPFS_PATH"
   fi
 }
 
@@ -513,15 +537,29 @@ prepare_dirs() {
   fi
 }
 
+ensure_rpc_runtime_user() {
+  if ! deploys_rpc; then
+    return
+  fi
+
+  if ! id -u "$RPC_SERVICE_USER" >/dev/null 2>&1; then
+    useradd --system --home /nonexistent --shell /usr/sbin/nologin "$RPC_SERVICE_USER"
+  fi
+
+  touch "$LOG_ROOT/rpc.log"
+  chown -R "$RPC_SERVICE_USER:$RPC_SERVICE_USER" "$RPC_BASE_PATH"
+  chown "$RPC_SERVICE_USER:$RPC_SERVICE_USER" "$LOG_ROOT/rpc.log"
+}
+
 setup_logging() {
   mkdir -p "$DEPLOY_LOG_DIR"
-  if [[ -z "$DEPLOY_LOG_FILE" ]]; then
+  if [[ -z "${DEPLOY_LOG_FILE:-}" ]]; then
     DEPLOY_LOG_FILE="${DEPLOY_LOG_DIR}/deploy-$(date +%Y%m%d-%H%M%S).log"
   fi
   touch "$DEPLOY_LOG_FILE"
   chmod 600 "$DEPLOY_LOG_FILE"
-  exec > >(tee -a "$DEPLOY_LOG_FILE") 2>&1
-  echo "[信息] 部署日志文件：$DEPLOY_LOG_FILE"
+  exec > >(while IFS= read -r line; do printf '[%s] %s\n' "$(date "$LOG_TS_FORMAT")" "$line"; done | tee -a "$DEPLOY_LOG_FILE") 2>&1
+  log_info "部署日志文件：$DEPLOY_LOG_FILE"
 }
 
 clone_repo() {
@@ -554,7 +592,7 @@ clone_repo() {
     exit 1
   fi
   DEPLOY_COMMIT="$(git rev-parse HEAD)"
-  echo "[信息] 部署提交：$DEPLOY_COMMIT"
+  log_info "部署提交：$DEPLOY_COMMIT"
 }
 
 # [修复1] --locked 失败时自动回退到不带 --locked
@@ -563,7 +601,7 @@ build_binary() {
   # shellcheck disable=SC1091
   source /root/.cargo/env
   if ! cargo build --locked --release; then
-    echo "[警告] cargo build --locked 失败，尝试不带 --locked 编译"
+    log_warn "cargo build --locked 失败，尝试不带 --locked 编译"
     if ! cargo build --release; then
       echo
       echo "[错误] 编译失败。"
@@ -593,7 +631,7 @@ inspect_validator_keys() {
     return
   fi
 
-  echo "[信息] 从助记词派生验证者公钥"
+  log_info "从助记词派生验证者公钥"
   local sr_out ed_out sr_err ed_err
 
   sr_err="$(mktemp)"
@@ -642,7 +680,7 @@ inspect_validator_keys() {
 
 # [修复6] 使用动态 chain id 路径
 generate_network_keys() {
-  echo "[信息] 正在生成节点网络密钥"
+  log_info "正在生成节点网络密钥"
   local chain_id
   chain_id="$(get_chain_id)"
 
@@ -685,7 +723,7 @@ insert_session_keys() {
     exit 1
   fi
 
-  echo "[信息] 插入 BABE (Sr25519) session key..."
+  log_info "插入 BABE (Sr25519) session key..."
   if ! "$BIN_INSTALL_PATH" key insert \
     --base-path "$VALIDATOR_BASE_PATH" \
     --chain "$CHAIN" \
@@ -698,7 +736,7 @@ insert_session_keys() {
     exit 1
   fi
 
-  echo "[信息] 插入 GRANDPA (Ed25519) session key..."
+  log_info "插入 GRANDPA (Ed25519) session key..."
   if ! "$BIN_INSTALL_PATH" key insert \
     --base-path "$VALIDATOR_BASE_PATH" \
     --chain "$CHAIN" \
@@ -746,6 +784,13 @@ EOF
   fi
 
   if deploys_rpc; then
+    local rpc_cors
+    if [[ "$INSTALL_NGINX" == "true" ]]; then
+      rpc_cors="https://${RPC_DOMAIN},http://${RPC_DOMAIN}"
+    else
+    log_warn "INSTALL_NGINX=false，RPC 将直接暴露在公网端口上，请确认这是有意为之。"
+      rpc_cors="http://127.0.0.1:${RPC_RPC_PORT}"
+    fi
     cat >/etc/systemd/system/nexus-rpc.service <<EOF
 [Unit]
 Description=Nexus Public RPC Node
@@ -754,7 +799,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=${NODE_USER}
+User=${RPC_SERVICE_USER}
 ExecStart=${BIN_INSTALL_PATH} \
   --chain ${CHAIN} \
   --base-path ${RPC_BASE_PATH} \
@@ -762,7 +807,7 @@ ExecStart=${BIN_INSTALL_PATH} \
   --rpc-port ${RPC_RPC_PORT} \
   --prometheus-port ${RPC_PROM_PORT} \
   --rpc-external \
-  --rpc-cors all \
+  --rpc-cors ${rpc_cors} \
   --rpc-methods Safe \
   --name ${RPC_NAME} \
   --bootnodes ${BOOTNODES}
@@ -799,8 +844,8 @@ EOF
 
 # [修复10] 配置 logrotate 防止日志填满磁盘
 setup_logrotate() {
-  cat >/etc/logrotate.d/nexus <<'LOGROTATE'
-/var/log/nexus/*.log {
+  cat >/etc/logrotate.d/nexus <<EOF
+${LOG_ROOT}/*.log {
     daily
     rotate 14
     compress
@@ -809,8 +854,8 @@ setup_logrotate() {
     notifempty
     copytruncate
 }
-LOGROTATE
-  echo "[信息] 已配置 logrotate：/etc/logrotate.d/nexus"
+EOF
+  log_info "已配置 logrotate：/etc/logrotate.d/nexus"
 }
 
 write_ipfs_systemd_unit() {
@@ -935,8 +980,8 @@ obtain_cert() {
     CERTBOT_OK="true"
     write_nginx_https_site
   else
-    echo "[警告] Certbot 证书申请失败（DNS 可能尚未解析到本机 IP）。"
-    echo "[警告] 节点部署将继续，HTTPS 稍后可手动配置：certbot --nginx -d $RPC_DOMAIN"
+    log_warn "Certbot 证书申请失败（DNS 可能尚未解析到本机 IP）。"
+    log_warn "节点部署将继续，HTTPS 稍后可手动配置：certbot --nginx -d $RPC_DOMAIN"
   fi
 }
 
@@ -985,6 +1030,7 @@ start_services() {
     systemctl restart nexus-validator
   fi
   if deploys_rpc; then
+    ensure_rpc_runtime_user
     systemctl restart nexus-rpc
   fi
 }
@@ -996,14 +1042,14 @@ wait_rpc_ready() {
   local max_wait=180
   local elapsed=0
 
-  echo "[信息] 等待 ${name} RPC 就绪：${rpc}"
+  log_info "等待 ${name} RPC 就绪：${rpc}"
   while (( elapsed < max_wait )); do
     local response
     response="$(curl -s -H 'Content-Type: application/json' \
       -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' \
       "$rpc" 2>/dev/null || echo "")"
     if [[ "$(echo "$response" | jq -r 'has("result")' 2>/dev/null || echo false)" == "true" ]]; then
-      echo "[信息] ${name} RPC 已就绪"
+      log_info "${name} RPC 已就绪"
       return 0
     fi
 
@@ -1011,19 +1057,44 @@ wait_rpc_ready() {
     elapsed=$((elapsed + 5))
   done
 
-  echo "[错误] ${name} RPC 在 ${max_wait}s 内未就绪：${rpc}"
+  log_error "${name} RPC 在 ${max_wait}s 内未就绪：${rpc}"
   return 1
 }
 
+verify_public_rpc() {
+  if ! deploys_rpc || [[ "$INSTALL_NGINX" != "true" ]]; then
+    return 0
+  fi
+
+  local scheme="http"
+  if [[ "$INSTALL_CERTBOT" == "true" && "$CERTBOT_OK" == "true" ]]; then
+    scheme="https"
+  fi
+
+  local endpoint="${scheme}://127.0.0.1/"
+  local response
+  response="$(curl -s -H "Host: ${RPC_DOMAIN}" -H 'Content-Type: application/json' \
+    -d '{"id":1,"jsonrpc":"2.0","method":"system_health","params":[]}' \
+    "$endpoint" 2>/dev/null || echo "")"
+
+  if [[ "$(echo "$response" | jq -r 'has("result")' 2>/dev/null || echo false)" != "true" ]]; then
+    log_error "公网 RPC 反代探测失败：${scheme}://${RPC_DOMAIN}"
+    return 1
+  fi
+
+  log_success "公网 RPC 反代探测通过：${scheme}://${RPC_DOMAIN}"
+  return 0
+}
+
 verify_deployment() {
-  echo "[信息] 开始验证部署结果..."
+  log_info "开始验证部署结果..."
   local failed=0
 
   if deploys_validator; then
     if systemctl is-active --quiet nexus-validator; then
-      echo "[成功] nexus-validator 服务正在运行"
+      log_success "nexus-validator 服务正在运行"
     else
-      echo "[错误] nexus-validator 服务未运行"
+      log_error "nexus-validator 服务未运行"
       failed=1
     fi
 
@@ -1049,10 +1120,19 @@ verify_deployment() {
 
   if deploys_rpc; then
     if systemctl is-active --quiet nexus-rpc; then
-      echo "[成功] nexus-rpc 服务正在运行"
+      log_success "nexus-rpc 服务正在运行"
     else
-      echo "[错误] nexus-rpc 服务未运行"
+      log_error "nexus-rpc 服务未运行"
       failed=1
+    fi
+
+    if deploys_rpc && [[ "$INSTALL_NGINX" == "true" ]]; then
+      if systemctl is-active --quiet nginx; then
+        log_success "nginx 服务正在运行"
+      else
+        log_error "nginx 服务未运行"
+        failed=1
+      fi
     fi
 
     if wait_rpc_ready "RPC 节点" "$RPC_RPC_PORT"; then
@@ -1070,6 +1150,13 @@ verify_deployment() {
       echo "[信息] RPC 节点健康状态：$health"
       echo "[信息] RPC 节点同步状态：$sync_state"
       echo "[信息] RPC 节点 genesis hash：${genesis_hash:-unknown}"
+      if ! verify_public_rpc; then
+        failed=1
+      fi
+      if [[ "$INSTALL_NGINX" == "true" && "$INSTALL_CERTBOT" == "true" && "$CERTBOT_OK" != "true" ]]; then
+        echo "[错误] 已请求 HTTPS，但证书尚未就绪；公网 HTTPS 交付未完成。"
+        failed=1
+      fi
     else
       failed=1
     fi
@@ -1077,24 +1164,24 @@ verify_deployment() {
 
   if [[ "$INSTALL_IPFS" == "true" ]]; then
     if systemctl is-active --quiet ipfs; then
-      echo "[成功] ipfs 服务正在运行"
+      log_success "ipfs 服务正在运行"
     else
-      echo "[错误] ipfs 服务未运行"
+      log_error "ipfs 服务未运行"
       failed=1
     fi
   fi
 
   if (( failed != 0 )); then
-    echo "[错误] 部署结果验证失败，请查看上方日志和 systemd 状态。"
+    log_error "部署结果验证失败，请查看上方日志和 systemd 状态。"
     return 1
   fi
 
-  echo "[完成] 部署结果验证通过。"
+  log_success "部署结果验证通过。"
 }
 
 # 等待验证者节点同步到最新区块
 wait_sync() {
-  echo "[信息] 等待验证者节点同步..."
+  log_info "等待验证者节点同步..."
   local rpc="http://127.0.0.1:${VALIDATOR_RPC_PORT}"
   local elapsed=0
 
@@ -1108,7 +1195,7 @@ wait_sync() {
       local is_syncing
       is_syncing="$(echo "$health" | jq -r 'if .result.isSyncing == false then "false" else "true" end')"
       if [[ "$is_syncing" == "false" ]]; then
-        echo "[信息] 节点已同步到最新区块"
+        log_info "节点已同步到最新区块"
         return 0
       fi
     fi
@@ -1120,11 +1207,37 @@ wait_sync() {
       sync_state="$(curl -s -H 'Content-Type: application/json' \
         -d '{"id":1,"jsonrpc":"2.0","method":"system_syncState","params":[]}' \
         "$rpc" 2>/dev/null || echo "(无法获取同步状态)")"
-      echo "[信息] 仍在同步，已等待 ${elapsed}s..."
+      log_info "仍在同步，已等待 ${elapsed}s..."
       echo "  节点健康状态：$health"
       echo "  同步进度：$sync_state"
     fi
   done
+}
+
+write_register_status() {
+  local status="$1"
+  local message="$2"
+  local submitted_steps="${3:-[]}"
+  local tx_hashes="${4:-[]}"
+  local bonded_state="${5:-false}"
+  local validate_state="${6:-false}"
+  local keys_state="${7:-false}"
+
+  mkdir -p "$(dirname "$REGISTER_STATUS_FILE")"
+  cat > "$REGISTER_STATUS_FILE" <<EOF
+{
+  "timestamp": "$(date -Iseconds)",
+  "validatorAddress": $(jq -Rn --arg v "$VALIDATOR_ADDRESS" '$v'),
+  "status": $(jq -Rn --arg v "$status" '$v'),
+  "message": $(jq -Rn --arg v "$message" '$v'),
+  "submittedSteps": ${submitted_steps},
+  "txHashes": ${tx_hashes},
+  "bonded": ${bonded_state},
+  "validatorRegistered": ${validate_state},
+  "sessionKeysRegistered": ${keys_state}
+}
+EOF
+  chmod 600 "$REGISTER_STATUS_FILE"
 }
 
 # 链上注册验证者：bond + setKeys + validate
@@ -1133,34 +1246,8 @@ register_validator() {
     return
   fi
 
-  echo "[信息] 开始链上验证者注册..."
-
-  # 获取 session keys
-  local rotate_result
-  rotate_result="$(curl -s -H 'Content-Type: application/json' \
-    -d '{"id":1,"jsonrpc":"2.0","method":"author_rotateKeys","params":[]}' \
-    "http://127.0.0.1:${VALIDATOR_RPC_PORT}")"
-
-  SESSION_KEYS="$(echo "$rotate_result" | jq -r '.result // empty')"
-  if [[ -z "$SESSION_KEYS" ]]; then
-    local rpc_error
-    rpc_error="$(echo "$rotate_result" | jq -r '.error.message // empty')"
-    echo "[错误] 无法获取 session keys"
-    echo "  RPC 响应：$rotate_result"
-    if [[ -n "$rpc_error" ]]; then
-      echo "  错误信息：$rpc_error"
-    fi
-    echo
-    echo "  常见原因："
-    echo "  1. 节点尚未完全启动 — 检查：systemctl status nexus-validator"
-    echo "  2. RPC 端口 ${VALIDATOR_RPC_PORT} 未监听 — 检查：ss -tlnp | grep ${VALIDATOR_RPC_PORT}"
-    echo "  3. keystore 中缺少 session key 文件。"
-    echo
-    echo "  手动重试："
-    echo "  curl -s -H 'Content-Type: application/json' -d '{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"author_rotateKeys\",\"params\":[]}' http://127.0.0.1:${VALIDATOR_RPC_PORT}"
-    return 1
-  fi
-  echo "[信息] Session Keys: $SESSION_KEYS"
+  log_info "开始链上验证者注册..."
+  log_info "注册状态摘要文件：$REGISTER_STATUS_FILE"
 
   # 安装 @polkadot/api 依赖
   local node_ver
@@ -1184,11 +1271,58 @@ PKGJSON
 
   # 执行注册
   local ws_url="ws://127.0.0.1:${VALIDATOR_RPC_PORT}"
+  local rpc_http_url="http://127.0.0.1:${VALIDATOR_RPC_PORT}"
   local commission="${VALIDATOR_COMMISSION}"
+  local dry_run="${REGISTER_DRY_RUN:-false}"
 
-  node -e "
+  RPC_HTTP_URL="$rpc_http_url" REGISTER_STATUS_FILE="$REGISTER_STATUS_FILE" REGISTER_DRY_RUN="$dry_run" node -e "
+const fs = require('fs');
 const { ApiPromise, WsProvider, Keyring } = require('@polkadot/api');
 const { cryptoWaitReady } = require('@polkadot/util-crypto');
+
+function writeRegisterStatus(payload) {
+  fs.writeFileSync(process.env.REGISTER_STATUS_FILE, JSON.stringify({
+    timestamp: new Date().toISOString(),
+    validatorAddress: '${VALIDATOR_ADDRESS}',
+    ...payload
+  }, null, 2));
+}
+
+async function rotateSessionKeys() {
+  const response = await fetch(process.env.RPC_HTTP_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: 1, jsonrpc: '2.0', method: 'author_rotateKeys', params: [] })
+  });
+  const payload = await response.json();
+  if (!payload.result) {
+    throw new Error(payload.error?.message || 'author_rotateKeys 返回空结果');
+  }
+  return payload.result;
+}
+
+function normalizeValue(value) {
+  if (value == null) return null;
+  if (typeof value === 'string') return value.toLowerCase();
+  if (Array.isArray(value)) return value.map(normalizeValue);
+  if (typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = normalizeValue(v);
+    return out;
+  }
+  return value;
+}
+
+function hasMeaningfulValidatorPrefs(prefs) {
+  if (!prefs) return false;
+  if (typeof prefs.isEmpty === 'boolean') return !prefs.isEmpty;
+  const human = prefs.toHuman ? prefs.toHuman() : prefs;
+  if (human == null) return false;
+  if (typeof human === 'object' && Object.keys(human).length === 0) return false;
+  return true;
+}
+
+const dryRun = process.env.REGISTER_DRY_RUN === 'true';
 
 async function main() {
   await cryptoWaitReady();
@@ -1201,6 +1335,15 @@ async function main() {
   const expectedAddress = '${VALIDATOR_ADDRESS}';
 
   if (validator.address !== expectedAddress) {
+    writeRegisterStatus({
+      status: 'failed',
+      message: '助记词派生地址与 VALIDATOR_ADDRESS 不匹配',
+      submittedSteps: [],
+      txHashes: [],
+      bonded: false,
+      validatorRegistered: false,
+      sessionKeysRegistered: false
+    });
     console.error('[错误] 助记词派生地址与 VALIDATOR_ADDRESS 不匹配');
     console.error('  派生地址:', validator.address);
     console.error('  期望地址:', expectedAddress);
@@ -1210,13 +1353,29 @@ async function main() {
     process.exit(1);
   }
   console.log('[信息] 验证者地址:', validator.address);
+  if (dryRun) {
+    console.log('[信息] dry-run 模式：只检查，不旋转 keys，不提交交易');
+  }
 
-  // 查询余额
   const { data: balance } = await api.query.system.account(validator.address);
   const free = balance.free.toBigInt();
   console.log('[信息] 可用余额:', free.toString());
 
+  const bonded = await api.query.staking.bonded(validator.address);
+  const commissionPerbill = ${commission} * 10000000;
+  const validatorPrefs = await api.query.staking.validators(validator.address);
+  const validateAlreadyDone = hasMeaningfulValidatorPrefs(validatorPrefs);
+
   if (free === 0n) {
+    writeRegisterStatus({
+      status: 'failed',
+      message: '账户余额为 0，无法质押',
+      submittedSteps: [],
+      txHashes: [],
+      bonded: !bonded.isNone,
+      validatorRegistered: validateAlreadyDone,
+      sessionKeysRegistered: false
+    });
     console.error('[错误] 账户余额为 0，无法质押');
     console.error('  地址:', validator.address);
     console.error();
@@ -1226,38 +1385,129 @@ async function main() {
     process.exit(1);
   }
 
-  // 检查是否已经 bonded
-  const bonded = await api.query.staking.bonded(validator.address);
-  const sessionKeys = '${SESSION_KEYS}';
-  const commissionPerbill = ${commission} * 10000000;  // 百分比转 Perbill
+  let nextKeysQueryAvailable = typeof api.query.session?.nextKeys === 'function';
+  let onChainNextKeys = null;
+  if (nextKeysQueryAvailable) {
+    try {
+      onChainNextKeys = await api.query.session.nextKeys(validator.address);
+    } catch (error) {
+      console.log('[警告] 读取 session.nextKeys 失败，将使用保守 fallback:', error.message);
+      nextKeysQueryAvailable = false;
+    }
+  }
+
+  const needsBond = bonded.isNone;
+  const needsValidate = !validateAlreadyDone;
+  let needsSetKeys = false;
+
+  if (nextKeysQueryAvailable) {
+    needsSetKeys = !onChainNextKeys || (typeof onChainNextKeys.isNone === 'boolean' ? onChainNextKeys.isNone : !normalizeValue(onChainNextKeys.toJSON ? onChainNextKeys.toJSON() : onChainNextKeys));
+  } else {
+    needsSetKeys = !validateAlreadyDone;
+    if (!nextKeysQueryAvailable) {
+      console.log('[警告] 当前 runtime 不支持稳定读取 session.nextKeys；若已完成 validator 注册，将保守跳过重复 setKeys。');
+    }
+  }
 
   const txs = [];
+  const submittedSteps = [];
+  const txHashes = [];
+  let desiredSessionKeys = null;
 
-  if (bonded.isNone) {
-    // 预留一部分作为手续费
+  if (needsBond) {
     const existentialDeposit = api.consts.balances.existentialDeposit.toBigInt();
     const reserveForFees = free / 100n > existentialDeposit ? free / 100n : existentialDeposit * 10n;
     const bondAmount = free - reserveForFees;
     console.log('[信息] 质押金额:', bondAmount.toString());
     txs.push(api.tx.staking.bond(bondAmount, 'Staked'));
+    submittedSteps.push('bond');
   } else {
     console.log('[信息] 已有 bond，跳过 bond 步骤');
   }
 
-  txs.push(api.tx.session.setKeys(sessionKeys, '0x'));
-  txs.push(api.tx.staking.validate({ commission: commissionPerbill, blocked: false }));
+  if (needsSetKeys && dryRun) {
+    console.log('[信息] dry-run：检测到仍需 setKeys，正式执行时才会 rotateSessionKeys');
+  } else if (needsSetKeys) {
+    desiredSessionKeys = await rotateSessionKeys();
+    console.log('[信息] Session Keys:', desiredSessionKeys);
 
-  if (txs.length === 1) {
-    const hash = await txs[0].signAndSend(validator);
-    console.log('[信息] 交易已发送:', hash.toHex());
-  } else if (api.tx.utility) {
+    if (nextKeysQueryAvailable) {
+      const currentKeys = normalizeValue(onChainNextKeys?.toJSON ? onChainNextKeys.toJSON() : onChainNextKeys);
+      const desiredKeys = normalizeValue(desiredSessionKeys);
+      if (currentKeys && JSON.stringify(currentKeys) === JSON.stringify(desiredKeys)) {
+        console.log('[信息] 链上 session keys 已匹配，跳过 setKeys');
+        needsSetKeys = false;
+      }
+    }
+  } else {
+    console.log('[信息] 已检测到链上 session keys，跳过 setKeys');
+  }
+
+  if (needsSetKeys) {
+    if (!dryRun) {
+      txs.push(api.tx.session.setKeys(desiredSessionKeys, '0x'));
+    }
+    submittedSteps.push('setKeys');
+  }
+
+  if (needsValidate) {
+    if (!dryRun) {
+      txs.push(api.tx.staking.validate({ commission: commissionPerbill, blocked: false }));
+    }
+    submittedSteps.push('validate');
+  } else {
+    console.log('[信息] 已检测到 validator 注册信息，跳过 validate');
+  }
+
+  if (dryRun) {
+    const message = submittedSteps.length === 0
+      ? 'dry-run 检查完成：当前已完成注册，无需提交交易'
+      : 'dry-run 检查完成：若正式执行 register，将提交缺失步骤';
+    writeRegisterStatus({
+      status: 'dry_run',
+      message,
+      submittedSteps,
+      txHashes,
+      bonded: !bonded.isNone,
+      validatorRegistered: validateAlreadyDone,
+      sessionKeysRegistered: !needsSetKeys
+    });
+    console.log('[信息] dry-run bonded:', !bonded.isNone);
+    console.log('[信息] dry-run validatorRegistered:', validateAlreadyDone);
+    console.log('[信息] dry-run sessionKeysRegistered:', !needsSetKeys);
+    console.log('[信息] dry-run 待补齐步骤:', JSON.stringify(submittedSteps));
+    console.log(submittedSteps.length === 0
+      ? '[完成] dry-run：当前已完成注册，无需执行任何交易'
+      : '[完成] dry-run：如果现在执行 register，将提交上述步骤');
+    await api.disconnect();
+    return;
+  }
+
+  if (txs.length === 0) {
+    writeRegisterStatus({
+      status: 'already_complete',
+      message: '验证者已完成注册配置，无需重复提交交易',
+      submittedSteps,
+      txHashes,
+      bonded: !bonded.isNone,
+      validatorRegistered: validateAlreadyDone,
+      sessionKeysRegistered: !needsSetKeys
+    });
+    console.log('[完成] 验证者已完成注册配置，无需重复提交交易');
+    await api.disconnect();
+    return;
+  }
+
+  if (api.tx.utility) {
     const batch = api.tx.utility.batchAll(txs);
     const hash = await batch.signAndSend(validator);
+    txHashes.push(hash.toHex());
     console.log('[信息] 批量交易已发送:', hash.toHex());
   } else {
     console.log('[信息] utility pallet 不可用，逐笔发送交易...');
     for (let i = 0; i < txs.length; i++) {
       const hash = await txs[i].signAndSend(validator);
+      txHashes.push(hash.toHex());
       console.log('[信息] 交易 ' + (i + 1) + '/' + txs.length + ' 已发送:', hash.toHex());
       if (i < txs.length - 1) {
         await new Promise(r => setTimeout(r, 6000));
@@ -1265,11 +1515,54 @@ async function main() {
     }
   }
 
-  console.log('[完成] 验证者注册交易已提交，等待下个 era 生效');
+  const bondedAfter = await api.query.staking.bonded(validator.address);
+  const validatorPrefsAfter = await api.query.staking.validators(validator.address);
+  const validateAfterDone = hasMeaningfulValidatorPrefs(validatorPrefsAfter);
+  let keysAfterDone = !nextKeysQueryAvailable;
+  if (nextKeysQueryAvailable) {
+    const nextKeysAfter = await api.query.session.nextKeys(validator.address);
+    const normalizedAfter = normalizeValue(nextKeysAfter?.toJSON ? nextKeysAfter.toJSON() : nextKeysAfter);
+    const normalizedDesired = normalizeValue(desiredSessionKeys);
+    keysAfterDone = normalizedDesired ? JSON.stringify(normalizedAfter) === JSON.stringify(normalizedDesired) : !!normalizedAfter;
+  }
+
+  if ((!needsBond || !bondedAfter.isNone) && (!needsValidate || validateAfterDone) && (!needsSetKeys || keysAfterDone)) {
+    writeRegisterStatus({
+      status: 'submitted_missing_steps',
+      message: '验证者注册状态已补齐或保持正确，可安全重复执行本命令',
+      submittedSteps,
+      txHashes,
+      bonded: !bondedAfter.isNone,
+      validatorRegistered: validateAfterDone,
+      sessionKeysRegistered: keysAfterDone
+    });
+    console.log('[完成] 验证者注册状态已补齐或保持正确，可安全重复执行本命令');
+  } else {
+    writeRegisterStatus({
+      status: 'partially_confirmed',
+      message: '注册交易已提交；若链上状态尚未完全更新，可稍后重试本命令补齐剩余步骤。',
+      submittedSteps,
+      txHashes,
+      bonded: !bondedAfter.isNone,
+      validatorRegistered: validateAfterDone,
+      sessionKeysRegistered: keysAfterDone
+    });
+    console.log('[信息] 注册交易已提交；若链上状态尚未完全更新，可稍后重试本命令补齐剩余步骤。');
+  }
+
   await api.disconnect();
 }
 
 main().catch(e => {
+  writeRegisterStatus({
+    status: 'failed',
+    message: e.message,
+    submittedSteps: typeof submittedSteps !== 'undefined' ? submittedSteps : [],
+    txHashes: typeof txHashes !== 'undefined' ? txHashes : [],
+    bonded: false,
+    validatorRegistered: false,
+    sessionKeysRegistered: false
+  });
   console.error('[错误] 验证者注册失败:', e.message);
   console.error();
   console.error('  常见原因：');
@@ -1342,9 +1635,11 @@ RPC PeerId：
 
 RPC 服务状态命令：
   systemctl status nexus-rpc --no-pager
+  systemctl status nginx --no-pager
 
 RPC 日志查看命令：
   tail -f ${LOG_ROOT}/rpc.log
+  journalctl -u nginx -n 100 --no-pager
 
 IPFS 服务状态命令：
   systemctl status ipfs --no-pager
@@ -1381,8 +1676,10 @@ EOF
 
   if [[ "$CERTBOT_OK" != "true" && "$INSTALL_CERTBOT" == "true" ]] && deploys_rpc; then
     echo
-    echo "[待办] HTTPS 证书未成功申请。DNS 解析就绪后执行："
+    log_warn "HTTPS 证书未成功申请，公网 HTTPS 交付未完成。DNS 解析就绪后请补跑 certbot。"
     echo "  certbot --nginx --non-interactive --agree-tos -m $CERTBOT_EMAIL -d $RPC_DOMAIN"
+    echo "  systemctl status nexus-rpc nginx --no-pager"
+    echo "  curl -s -H 'Host: $RPC_DOMAIN' -H 'Content-Type: application/json' -d '{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"system_health\",\"params\":[]}' http://127.0.0.1/ | jq"
   fi
 
   if [[ "$WRITE_MNEMONIC_FILE" == "true" ]] && deploys_validator; then
@@ -1392,7 +1689,7 @@ EOF
 }
 
 print_runtime_status() {
-  echo "[信息] tmux 会话："
+  log_info "tmux 会话："
   if command -v tmux >/dev/null 2>&1; then
     tmux ls 2>/dev/null || echo "未发现 tmux 会话"
   else
@@ -1400,16 +1697,30 @@ print_runtime_status() {
   fi
 
   echo
-  echo "[信息] 相关进程："
+  log_info "相关进程："
   pgrep -af 'cargo|rustc|nexus-node|wasm-opt|rocksdb' || echo "未发现相关进程"
 
   echo
-  echo "[信息] 监听端口："
+  log_info "监听端口："
   ss -lntp 2>/dev/null | grep -E '9944|9947|9933|30333|30334|nexus' || echo "未发现常见节点端口"
 
   echo
-  echo "[信息] systemd 服务："
+  log_info "systemd 服务："
   systemctl --no-pager --full status nexus-validator nexus-rpc ipfs 2>/dev/null || true
+
+  if deploys_rpc && [[ "$INSTALL_NGINX" == "true" ]]; then
+    echo
+    log_info "Nginx 状态："
+    systemctl status nginx --no-pager || true
+  fi
+
+  echo
+  log_info "最近一次注册摘要："
+  if [[ -f "$REGISTER_STATUS_FILE" ]]; then
+    jq . "$REGISTER_STATUS_FILE" 2>/dev/null || cat "$REGISTER_STATUS_FILE"
+  else
+    echo "未找到注册摘要文件：$REGISTER_STATUS_FILE"
+  fi
 }
 
 print_recent_logs() {
@@ -1439,7 +1750,7 @@ start_in_tmux() {
   fi
 
   mkdir -p "$DEPLOY_LOG_DIR"
-  if [[ -z "$DEPLOY_LOG_FILE" ]]; then
+  if [[ -z "${DEPLOY_LOG_FILE:-}" ]]; then
     DEPLOY_LOG_FILE="${DEPLOY_LOG_DIR}/deploy-$(date +%Y%m%d-%H%M%S).log"
   fi
 
@@ -1525,6 +1836,41 @@ main() {
   print_summary
 }
 
+wait_for_validator_registration() {
+  require_cmd curl
+  require_cmd jq
+  require_cmd node
+
+  local dry_run="${1:-false}"
+  REGISTER_DRY_RUN="$dry_run"
+  export REGISTER_DRY_RUN
+
+  validate_config
+  prepare_dirs
+  setup_logging
+
+  if ! deploys_validator; then
+    echo "[错误] 当前 DEPLOY_MODE=${DEPLOY_MODE}，未启用 validator，无法执行 register"
+    return 1
+  fi
+
+  if [[ ! -x "$BIN_INSTALL_PATH" ]]; then
+    echo "[错误] 未找到 nexus-node 可执行文件：$BIN_INSTALL_PATH"
+    echo "  请先完成 validator 部署，再执行 register。"
+    return 1
+  fi
+
+  if ! systemctl is-active --quiet nexus-validator; then
+    echo "[错误] nexus-validator 服务未运行"
+    echo "  检查：systemctl status nexus-validator --no-pager"
+    return 1
+  fi
+
+  wait_rpc_ready "验证者节点" "$VALIDATOR_RPC_PORT"
+  wait_sync
+  REGISTER_VALIDATOR=true register_validator
+}
+
 # 支持单独调用函数：
 #   bash deploy_nexus_server.sh                  — 在 tmux 后台启动完整部署
 #   bash deploy_nexus_server.sh start            — 在 tmux 后台启动完整部署
@@ -1533,6 +1879,7 @@ main() {
 #   bash deploy_nexus_server.sh logs             — 跟踪最新部署日志
 #   bash deploy_nexus_server.sh attach           — 进入部署 tmux 会话
 #   bash deploy_nexus_server.sh register         — 仅注册验证者
+#   bash deploy_nexus_server.sh register --dry-run — 仅检查注册状态，不提交交易
 #   source deploy_nexus_server.sh noop           — 仅加载函数，不执行
 case "${1:-start}" in
   start|"")
@@ -1551,14 +1898,24 @@ case "${1:-start}" in
     attach_tmux
     ;;
   register)
-    setup_logging
-    REGISTER_VALIDATOR=true register_validator
+    case "${2:-}" in
+      --dry-run)
+        wait_for_validator_registration true
+        ;;
+      "")
+        wait_for_validator_registration false
+        ;;
+      *)
+        echo "用法：$0 register [--dry-run]"
+        exit 1
+        ;;
+    esac
     ;;
   noop)
     : # 仅加载函数
     ;;
   *)
-    echo "用法：$0 {start|run|status|logs|attach|register|noop}"
+    echo "用法：$0 {start|run|status|logs|attach|register [--dry-run]|noop}"
     exit 1
     ;;
 esac
