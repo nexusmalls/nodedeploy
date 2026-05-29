@@ -447,6 +447,30 @@ apt_install() {
   fi
 }
 
+sync_server_time() {
+  log_info "校准服务器时间（区块链节点要求时钟误差 < 1s）..."
+
+  if ! command -v chronyd &>/dev/null; then
+    apt-get install -y chrony
+  fi
+
+  systemctl enable chrony
+  systemctl start chrony
+
+  # 强制立即同步
+  chronyc makestep 2>/dev/null || true
+
+  local offset
+  offset=$(chronyc tracking 2>/dev/null | grep "Last offset" | awk '{print $4}') || offset="unknown"
+  log_info "当前时钟偏差：${offset}s"
+
+  if timedatectl show --property=NTPSynchronized --value 2>/dev/null | grep -q "yes"; then
+    log_success "时间同步正常"
+  else
+    log_warn "NTP 尚未完全同步，chrony 将在后台持续校准"
+  fi
+}
+
 install_ipfs() {
   if [[ "$INSTALL_IPFS" != "true" ]]; then
     log_info "已跳过 IPFS 安装（INSTALL_IPFS=false）"
@@ -1731,6 +1755,11 @@ print_recent_logs() {
 
   if [[ -n "$log_file" && -f "$log_file" ]]; then
     echo "[信息] 最新部署日志：$log_file"
+    echo "[提示] 这是部署日志，不包含持续的区块同步输出。"
+    echo "[提示] 查看验证者同步日志：tail -f ${LOG_ROOT}/validator.log"
+    if deploys_rpc; then
+      echo "[提示] 查看 RPC 日志：tail -f ${LOG_ROOT}/rpc.log"
+    fi
     tail -f "$log_file"
   else
     echo "[错误] 未找到部署日志。"
@@ -1777,6 +1806,10 @@ start_in_tmux() {
   tmux new-session -d -s "$TMUX_SESSION" "cd '$SCRIPT_DIR' && DEPLOY_LOG_FILE='$DEPLOY_LOG_FILE' flock -n '$DEPLOY_LOCK_FILE' bash '$SCRIPT_PATH' run"
   echo "[完成] 部署已在后台运行。SSH 断开不会中断部署。"
   echo "[提示] 查看日志：bash $SCRIPT_PATH logs"
+  echo "[提示] 验证者同步日志：tail -f ${LOG_ROOT}/validator.log"
+  if deploys_rpc; then
+    echo "[提示] RPC 日志：tail -f ${LOG_ROOT}/rpc.log"
+  fi
   echo "[提示] 查看状态：bash $SCRIPT_PATH status"
   echo "[提示] 进入会话：bash $SCRIPT_PATH attach"
 }
@@ -1812,6 +1845,7 @@ main() {
   prepare_dirs
   setup_logging
   apt_install
+  sync_server_time
   install_ipfs
   ensure_ipfs_repo
   ensure_rust

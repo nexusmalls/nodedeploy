@@ -35,6 +35,11 @@ usage() {
   bash remote_deploy.sh run      同步后在服务器前台执行部署，不推荐新手使用
   bash remote_deploy.sh register 同步后仅执行验证者注册
 
+日志说明：
+  部署日志仅显示安装、配置、启动和一次性健康检查。
+  验证者实时同步日志请在服务器上执行：tail -f /nexus/logs/validator.log
+  RPC 实时日志请在服务器上执行：tail -f /nexus/logs/rpc.log
+
 请先在 deploy.env 中填写：
   SERVER_HOST="服务器IP"
   SERVER_USER="root"
